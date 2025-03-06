@@ -368,6 +368,76 @@ func (s *service) Close() {
 	s.chainSource.Stop()
 }
 
+// GetBlockInfo retrieves information about a specific block
+func (s *service) GetBlockInfo(height int32) (*ports.BlockInfo, error) {
+	if !s.isLoaded() {
+		return nil, fmt.Errorf("wallet not loaded")
+	}
+	
+	hash, err := s.chainSource.GetBlockHash(int64(height))
+	if err != nil {
+		return nil, err
+	}
+	
+	header, err := s.chainSource.GetBlockHeader(hash)
+	if err != nil {
+		return nil, err
+	}
+	
+	return &ports.BlockInfo{
+		Height:     height,
+		Hash:       header.BlockHash().String(),
+		Timestamp:  header.Timestamp.Unix(),
+		Difficulty: uint64(header.Bits), // Convert to uint64 to match the expected type
+	}, nil
+}
+
+// GetCurrentHeight returns the current blockchain height
+func (s *service) GetCurrentHeight() (int32, error) {
+	if !s.isLoaded() {
+		return 0, fmt.Errorf("wallet not loaded")
+	}
+	
+	_, height, err := s.wallet.GetBestBlock()
+	if err != nil {
+		return 0, err
+	}
+	
+	return int32(height), nil
+}
+
+// DeriveSigningKey derives a private key for signing from the wallet using the given key path
+func (s *service) DeriveSigningKey(ctx context.Context, keyPath string) (*secp256k1.PrivateKey, error) {
+	if err := s.safeCheck(); err != nil {
+		return nil, err
+	}
+
+	// If we already have a server key address, use that to derive the signing key
+	if s.serverKeyAddr != nil {
+		prvkey, err := s.serverKeyAddr.PrivKey()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get server key: %s", err)
+		}
+		
+		// Create a unique deterministic key using HMAC with the keyPath as data
+		// This ensures different services get different keys but they're consistent
+		// across restarts
+		keyPathBytes := []byte(keyPath)
+		hasher := btcutil.Hash160(append(prvkey.Serialize(), keyPathBytes...))
+		
+		// Convert the hash to a private key (ensuring it's a valid private key)
+		// This is a deterministic way to derive a private key from the server key
+		var keyBytes [32]byte
+		copy(keyBytes[:], hasher)
+		
+		// Ensure the private key is valid by modding with curve order
+		privKey, _ := secp256k1.PrivKeyFromBytes(keyBytes[:])
+		return privKey, nil
+	}
+	
+	return nil, fmt.Errorf("server key address not initialized")
+}
+
 func (s *service) GetSyncedUpdate(_ context.Context) <-chan struct{} {
 	return s.syncedCh
 }

@@ -4,6 +4,8 @@ package ark.v1;
 
 import "google/api/annotations.proto";
 import "ark/v1/types.proto";
+option go_package = "github.com/ark-network/ark/api-spec/protobuf/gen/ark/v1;arkv1";
+
 
 service ArkService {
   rpc GetInfo(GetInfoRequest) returns (GetInfoResponse) {
@@ -17,7 +19,19 @@ service ArkService {
       body: "*"
     };
   };
+  rpc GetExitPath(GetExitPathRequest) returns (GetExitPathResponse) {
+  option (google.api.http) = {
+    post: "/v1/exit-path"
+    body: "*"
+	  };
+	}
 
+  rpc CreateOutOfRoundTx(CreateOutOfRoundTxRequest) returns (CreateOutOfRoundTxResponse) {
+    option (google.api.http) = {
+      post: "/v1/transactions/out-of-round"
+      body: "*"
+	  };
+	}
   /* In-Round Transaction APIs */
 
   rpc RegisterInputsForNextRound(RegisterInputsForNextRoundRequest) returns (RegisterInputsForNextRoundResponse) {

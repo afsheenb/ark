@@ -47,6 +47,13 @@ type WalletService interface {
 	GetCurrentBlockTime(ctx context.Context) (*BlockTimestamp, error)
 	Withdraw(ctx context.Context, address string, amount uint64) (string, error)
 	Close()
+	
+	// Added for BtcWalletService support
+	GetBlockInfo(height int32) (*BlockInfo, error)
+	GetCurrentHeight() (int32, error)
+	
+	// Added for server signing key derivation
+	DeriveSigningKey(ctx context.Context, keyPath string) (*secp256k1.PrivateKey, error)
 }
 
 type WalletStatus interface {
@@ -71,4 +78,12 @@ type TxOutpoint interface {
 type BlockTimestamp struct {
 	Height uint32
 	Time   int64
+}
+
+// BlockInfo contains relevant information about a Bitcoin block
+type BlockInfo struct {
+	Height     int32  `json:"height"`
+	Hash       string `json:"hash"`
+	Timestamp  int64  `json:"timestamp"`
+	Difficulty uint64 `json:"difficulty"`
 }

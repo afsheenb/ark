@@ -143,6 +143,24 @@ func NewCovenantService(
 	return svc, nil
 }
 
+// ContractService returns the contract service for hashrate derivatives
+func (s *covenantService) ContractService() *ContractService {
+	// Not implemented for covenant service
+	return nil
+}
+
+// OrderBookService returns the orderbook service for hashrate derivatives
+func (s *covenantService) OrderBookService() *OrderBookService {
+	// Not implemented for covenant service
+	return nil
+}
+
+// HashrateCalculator returns the hashrate calculator for Bitcoin network
+func (s *covenantService) HashrateCalculator() *HashrateCalculator {
+	// Not implemented for covenant service
+	return nil
+}
+
 func (s *covenantService) Start() error {
 	log.Debug("starting sweeper service")
 	if err := s.sweeper.start(); err != nil {

@@ -1,0 +1,173 @@
+syntax = "proto3";
+
+package ark.v1;
+
+import "ark/v1/types.proto";
+import "google/api/annotations.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+
+option go_package = "github.com/ark-network/ark/api-spec/protobuf/gen/ark/v1;arkv1";
+
+option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
+  info: {
+    title: "Hashrate Contract API"
+    version: "1.0"
+    description: "API for hashrate derivative contracts"
+  }
+  schemes: HTTP
+  schemes: HTTPS
+  consumes: "application/json"
+  produces: "application/json"
+};
+
+service ContractService {
+  rpc CreateContract (CreateContractRequest) returns (CreateContractResponse) {
+    option (google.api.http) = {
+      post: "/v1/contracts"
+      body: "*"
+    };
+  }
+  rpc GetContract (GetContractRequest) returns (GetContractResponse) {
+    option (google.api.http) = {
+      get: "/v1/contracts/{id}"
+    };
+  }
+  rpc SetupContract (SetupContractRequest) returns (SetupContractResponse) {
+    option (google.api.http) = {
+      post: "/v1/contracts/{id}/setup"
+      body: "*"
+    };
+  }
+  rpc SettleContract (SettleContractRequest) returns (SettleContractResponse) {
+    option (google.api.http) = {
+      post: "/v1/contracts/{id}/settle"
+      body: "*"
+    };
+  }
+  rpc ListContracts (ListContractsRequest) returns (ListContractsResponse) {
+    option (google.api.http) = {
+      get: "/v1/contracts"
+    };
+  }
+  rpc GetHashrate (GetHashrateRequest) returns (GetHashrateResponse) {
+    option (google.api.http) = {
+      get: "/v1/hashrate"
+    };
+  }
+  rpc GetHistoricalHashrates (GetHistoricalHashratesRequest) returns (GetHistoricalHashratesResponse) {
+    option (google.api.http) = {
+      get: "/v1/hashrate/historical"
+    };
+  }
+  rpc CheckSettlement (CheckSettlementRequest) returns (CheckSettlementResponse) {
+    option (google.api.http) = {
+      get: "/v1/contracts/{id}/settlement/check"
+    };
+  }
+  rpc GetContractEvents (GetContractEventsRequest) returns (stream GetContractEventsResponse) {
+    option (google.api.http) = {
+      get: "/v1/contracts/{contract_id}/events"
+    };
+  }
+}
+
+message CreateContractRequest {
+  string strike_hash_rate = 1;
+  int32 start_block_height = 2;
+  int32 end_block_height = 3;
+  int64 target_timestamp = 4;
+  int32 contract_size = 5;
+  int32 premium = 6;
+  string buyer_pubkey = 7;
+  string seller_pubkey = 8;
+  int64 expires_at = 9;
+}
+
+message CreateContractResponse {
+  HashRateContract contract = 1;
+}
+
+message GetContractRequest {
+  string id = 1;
+}
+
+message GetContractResponse {
+  HashRateContract contract = 1;
+}
+
+// Note: Using HashRateContract message from types.proto
+
+message SetupContractRequest {
+  string id = 1;
+  string setup_tx = 2;
+}
+
+message SetupContractResponse {
+  string setup_txid = 1;
+  string signed_setup_tx = 2;
+}
+
+message SettleContractRequest {
+  string id = 1;
+  string settlement_tx = 2;
+}
+
+message SettleContractResponse {
+  string settlement_txid = 1;
+  string signed_settlement_tx = 2;
+  string winner_pubkey = 3;
+}
+
+message ListContractsRequest {
+  string user_pubkey = 1;
+  int32 limit = 2;
+  int32 offset = 3;
+}
+
+message ListContractsResponse {
+  repeated HashRateContract contracts = 1;
+  int32 total = 2;
+}
+
+message GetHashrateRequest {
+  int32 window_size = 1;
+}
+
+message GetHashrateResponse {
+  double hashrate = 1;
+  uint64 difficulty = 2;
+  int32 block_height = 3;
+  int64 timestamp = 4;
+}
+
+message GetHistoricalHashratesRequest {
+  int32 from_height = 1;
+  int32 to_height = 2;
+  int32 limit = 3;
+}
+
+message GetHistoricalHashratesResponse {
+  repeated HistoricalHashrate hashrates = 1;
+}
+
+message CheckSettlementRequest {
+  string id = 1;
+}
+
+message CheckSettlementResponse {
+  bool can_settle = 1;
+  string winner_pubkey = 2;
+  string reason = 3;
+}
+
+message GetContractEventsRequest {
+  string contract_id = 1;
+}
+
+message GetContractEventsResponse {
+  oneof event {
+    ContractCreatedEvent contract_created = 1;
+    ContractSetupEvent contract_setup = 2;
+    ContractSettledEvent contract_settled = 3;
+  }
+}

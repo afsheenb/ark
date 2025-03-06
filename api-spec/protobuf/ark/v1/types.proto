@@ -1,9 +1,9 @@
 syntax = "proto3";
 
 package ark.v1;
+option go_package = "github.com/ark-network/ark/api-spec/protobuf/gen/ark/v1;arkv1";
 
-/* Types */
-
+/* Rounds and Related Types */
 enum RoundStage {
   ROUND_STAGE_UNSPECIFIED = 0;
   ROUND_STAGE_REGISTRATION = 1;
@@ -38,7 +38,8 @@ message Input {
 
 message Output {
   string address = 1; // onchain or off-chain
-  uint64 amount = 2; // Amount to send in satoshis.
+  uint64 amount = 2;  // Amount in satoshis
+  string Script = 3;
 }
 
 message Tree {
@@ -82,11 +83,11 @@ message RedeemTransaction {
   repeated Vtxo spendable_vtxos = 3;
 }
 
-// This message is used to prove to the server that the user controls the vtxo without revealing the whole VTXO taproot tree.
+// Proves control of a VTXO without revealing the entire taproot tree.
 message OwnershipProof {
   string control_block = 1;
   string script = 2;
-  string signature = 3; // VTXO outpoint signed with script's secret key
+  string signature = 3;
 }
 
 message SignedVtxoOutpoint {
@@ -135,15 +136,112 @@ message RequestInput {
   uint64 amount = 3;
 }
 
-/* Events */
+/* Hashrate Derivatives Types */
+enum ContractType {
+  CONTRACT_TYPE_UNSPECIFIED = 0;
+  CONTRACT_TYPE_CALL = 1;
+  CONTRACT_TYPE_PUT = 2;
+}
 
+enum ContractStatus {
+  CONTRACT_STATUS_UNSPECIFIED = 0;
+  CONTRACT_STATUS_CREATED = 1;
+  CONTRACT_STATUS_SETUP = 2;  
+  CONTRACT_STATUS_ACTIVE = 3;
+  CONTRACT_STATUS_SETTLED = 4;
+  CONTRACT_STATUS_EXPIRED = 5;
+  CONTRACT_STATUS_FAILED = 6;
+}
+
+message HashRateContract {
+  string id = 1;
+  ContractType contract_type = 2;
+  double strike_hash_rate = 3;
+  int32 start_block_height = 4;
+  int32 end_block_height = 5;
+  int64 target_timestamp = 6;
+  uint64 contract_size = 7;
+  uint64 premium = 8;
+  string buyer_pubkey = 9;
+  string seller_pubkey = 10;
+  ContractStatus status = 11;
+  int64 created_at = 12;
+  int64 updated_at = 13;
+  int64 expires_at = 14;
+  string setup_txid = 15;
+  string final_txid = 16;
+  string settlement_txid = 17;
+}
+
+/* Order and Trade Types */
+enum OrderSide {
+  ORDER_SIDE_UNSPECIFIED = 0;
+  ORDER_SIDE_BUY = 1;
+  ORDER_SIDE_SELL = 2;
+}
+
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  ORDER_STATUS_OPEN = 1;
+  ORDER_STATUS_PARTIAL = 2;
+  ORDER_STATUS_FILLED = 3;
+  ORDER_STATUS_CANCELED = 4;
+  ORDER_STATUS_EXPIRED = 5;
+}
+
+message Order {
+  string id = 1;
+  string user_id = 2;
+  OrderSide side = 3;
+  ContractType contract_type = 4;
+  double strike_hash_rate = 5;
+  int32 start_block_height = 6;
+  int32 end_block_height = 7;
+  uint64 price = 8;
+  int32 quantity = 9;
+  int32 remaining_quantity = 10;
+  OrderStatus status = 11;
+  string pubkey = 12;
+  int64 created_at = 13;
+  int64 updated_at = 14;
+  int64 expires_at = 15;
+}
+
+message Trade {
+  string id = 1;
+  string buy_order_id = 2;
+  string sell_order_id = 3;
+  uint64 price = 4;
+  int32 quantity = 5;
+  int64 executed_at = 6;
+  string contract_id = 7;
+}
+
+message OrderBookEntry {
+  uint64 price = 1;
+  int32 quantity = 2;
+}
+
+message OrderBook {
+  repeated OrderBookEntry bids = 1;
+  repeated OrderBookEntry asks = 2;
+  int64 timestamp = 3;
+}
+
+message HistoricalHashrate {
+  int32 block_height = 1;
+  int64 timestamp = 2;
+  double hashrate = 3;
+  uint64 difficulty = 4;
+}
+
+/* Events */
 message RoundFinalizationEvent {
   string id = 1;
   string round_tx = 2;
   Tree vtxo_tree = 3;
   Tree connectors = 4;
   int64 min_relay_fee_rate = 5;
-  // vtxo outpoint encoded as string -> connector outpoint
   map<string, Outpoint> connectors_index = 6;
 }
 
@@ -168,3 +266,59 @@ message RoundSigningNoncesGeneratedEvent {
   string id = 1;
   string tree_nonces = 2;
 }
+
+/* Hashrate Contract Events */
+message ContractCreatedEvent {
+  HashRateContract contract = 1;
+}
+
+message ContractSetupEvent {
+  string contract_id = 1;
+  string setup_txid = 2;
+}
+
+message ContractSettledEvent {
+  string contract_id = 1;
+  string settlement_txid = 2;
+  string winner_pubkey = 3;
+}
+
+/* Order and Trade Events */
+message OrderCreatedEvent {
+  Order order = 1;
+}
+
+message OrderUpdatedEvent {
+  Order order = 1;
+}
+
+message TradeExecutedEvent {
+  Trade trade = 1;
+}
+
+
+// Message definitions for GetExitPath
+message GetExitPathRequest {
+  string vtxoId = 1;
+  string destinationAddress = 2;
+  int64 feeRate = 3;
+}
+
+message GetExitPathResponse {
+  string txid = 1;
+  string serializedPsbt = 2;
+  int64 timelock = 3;
+  string lockType = 4;
+}
+
+// Message definitions for CreateOutOfRoundTx
+message CreateOutOfRoundTxRequest {
+  string serializedPsbt = 1;
+  repeated Output outputs = 2;
+}
+
+message CreateOutOfRoundTxResponse {
+  string txid = 1;
+  string serializedPsbt = 2;
+}
+

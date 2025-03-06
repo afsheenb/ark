@@ -25,6 +25,9 @@ type service interface {
 }
 
 type handler struct {
+	arkv1.UnimplementedArkServiceServer
+	arkv1.UnimplementedExplorerServiceServer
+	
 	version string
 
 	svc application.Service
@@ -37,11 +40,13 @@ type handler struct {
 
 func NewHandler(version string, service application.Service, stopCh <-chan struct{}) service {
 	h := &handler{
-		version:                     version,
-		svc:                         service,
-		eventsListenerHandler:       newListenerHandler[*arkv1.GetEventStreamResponse](),
-		transactionsListenerHandler: newListenerHandler[*arkv1.GetTransactionsStreamResponse](),
-		stopCh:                      stopCh,
+		UnimplementedArkServiceServer:     arkv1.UnimplementedArkServiceServer{},
+		UnimplementedExplorerServiceServer: arkv1.UnimplementedExplorerServiceServer{},
+		version:                           version,
+		svc:                               service,
+		eventsListenerHandler:             newListenerHandler[*arkv1.GetEventStreamResponse](),
+		transactionsListenerHandler:       newListenerHandler[*arkv1.GetTransactionsStreamResponse](),
+		stopCh:                            stopCh,
 	}
 
 	go h.listenToEvents()

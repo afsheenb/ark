@@ -224,6 +224,24 @@ func (s *service) newServer(tlsConfig *tls.Config, withAppSvc bool) error {
 	)
 	arkv1.RegisterWalletInitializerServiceServer(grpcServer, walletInitHandler)
 
+	// Register hashrate derivatives handlers
+	if withAppSvc && appSvc != nil {
+		// Register contract service handler
+		contractService := appSvc.ContractService()
+		hashrateCalculator := appSvc.HashrateCalculator()
+		if contractService != nil && hashrateCalculator != nil {
+			contractHandler := handlers.NewContractServiceHandler(contractService, hashrateCalculator)
+			arkv1.RegisterContractServiceServer(grpcServer, contractHandler)
+		}
+
+		// Register orderbook service handler
+		orderBookService := appSvc.OrderBookService()
+		if orderBookService != nil {
+			orderBookHandler := handlers.NewOrderBookServiceHandler(orderBookService)
+			arkv1.RegisterOrderBookServiceServer(grpcServer, orderBookHandler)
+		}
+	}
+
 	healthHandler := handlers.NewHealthHandler()
 	grpchealth.RegisterHealthServer(grpcServer, healthHandler)
 
@@ -291,6 +309,19 @@ func (s *service) newServer(tlsConfig *tls.Config, withAppSvc bool) error {
 		); err != nil {
 			return err
 		}
+		
+		// Register hashrate derivatives handlers
+		// TODO: Uncomment once the gateway handlers are generated
+		// if err := arkv1.RegisterContractServiceHandler(
+		// 	ctx, gwmux, conn,
+		// ); err != nil {
+		// 	return err
+		// }
+		// if err := arkv1.RegisterOrderBookServiceHandler(
+		// 	ctx, gwmux, conn,
+		// ); err != nil {
+		// 	return err
+		// }
 	}
 	grpcGateway := http.Handler(gwmux)
 

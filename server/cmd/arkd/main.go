@@ -66,7 +66,12 @@ func mainAction(_ *cli.Context) error {
 	}
 
 	if cfg.AllowZeroFees {
-		log.Warn("WARNING: AllowZeroFees is enabled")
+		log.Warn("WARNING: AllowZeroFees is enabled - this should be disabled for production use")
+		// Set a 5-minute warning to ensure servers are restarted with this disabled
+		go func() {
+			time.Sleep(5 * time.Minute)
+			log.Error("CRITICAL: Server has been running with AllowZeroFees=true for 5 minutes. This is a security risk.")
+		}()
 	}
 
 	svc, err := grpcservice.NewService(Version, svcConfig, cfg)

@@ -1,0 +1,182 @@
+syntax = "proto3";
+
+package ark.v1;
+
+import "google/api/annotations.proto";
+import "ark/v1/types.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+
+option go_package = "github.com/ark-network/ark/api-spec/protobuf/gen/ark/v1;arkv1";
+
+option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
+  info: {
+    title: "OrderBook API"
+    version: "1.0"
+    description: "API for hashrate derivative orderbook"
+  }
+  schemes: HTTP
+  schemes: HTTPS
+  consumes: "application/json"
+  produces: "application/json"
+};
+
+service OrderBookService {
+  // Place a new order
+  rpc PlaceOrder(PlaceOrderRequest) returns (PlaceOrderResponse) {
+    option (google.api.http) = {
+      post: "/v1/orderbook/order"
+      body: "*"
+    };
+  }
+  
+  // Cancel an existing order
+  rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse) {
+    option (google.api.http) = {
+      post: "/v1/orderbook/order/{id}/cancel"
+      body: "*"
+    };
+  }
+  
+  // Get the current order book for a specific contract specification
+  rpc GetOrderBook(GetOrderBookRequest) returns (GetOrderBookResponse) {
+    option (google.api.http) = {
+      get: "/v1/orderbook"
+    };
+  }
+  
+  // Get a specific order by ID
+  rpc GetOrder(GetOrderRequest) returns (GetOrderResponse) {
+    option (google.api.http) = {
+      get: "/v1/orderbook/order/{id}"
+    };
+  }
+  
+  // List all orders for a specific user
+  rpc ListUserOrders(ListUserOrdersRequest) returns (ListUserOrdersResponse) {
+    option (google.api.http) = {
+      get: "/v1/orderbook/user/{user_id}/orders"
+    };
+  }
+  
+  // Get market data and statistics
+  rpc GetMarketData(GetMarketDataRequest) returns (GetMarketDataResponse) {
+    option (google.api.http) = {
+      get: "/v1/orderbook/marketdata"
+    };
+  }
+  
+  // Get a stream of order book events
+  rpc GetOrderBookEvents(GetOrderBookEventsRequest) returns (stream GetOrderBookEventsResponse) {
+    option (google.api.http) = {
+      get: "/v1/orderbook/events"
+    };
+  }
+  
+  // Get a list of trades
+  rpc ListTrades(ListTradesRequest) returns (ListTradesResponse) {
+    option (google.api.http) = {
+      get: "/v1/orderbook/trades"
+    };
+  }
+}
+
+message PlaceOrderRequest {
+  string user_id = 1;
+  OrderSide side = 2;
+  ContractType contract_type = 3;
+  double strike_hash_rate = 4;
+  int32 start_block_height = 5;
+  int32 end_block_height = 6;
+  uint64 price = 7;
+  int32 quantity = 8;
+  string pubkey = 9;
+  int64 expires_at = 10;
+}
+
+message PlaceOrderResponse {
+  Order order = 1;
+  repeated Trade trades = 2; // If order was matched immediately, contains the trades
+}
+
+message CancelOrderRequest {
+  string id = 1;
+  string user_id = 2; // For authorization
+}
+
+message CancelOrderResponse {
+  bool success = 1;
+}
+
+message GetOrderBookRequest {
+  ContractType contract_type = 1;
+  double strike_hash_rate = 2;
+  int32 start_block_height = 3;
+  int32 end_block_height = 4;
+  int32 limit = 5; // Limit number of entries per side
+}
+
+message GetOrderBookResponse {
+  OrderBook orderbook = 1;
+}
+
+message GetOrderRequest {
+  string id = 1;
+}
+
+message GetOrderResponse {
+  Order order = 1;
+}
+
+message ListUserOrdersRequest {
+  string user_id = 1;
+  OrderStatus status = 2;
+  int32 limit = 3;
+  int32 offset = 4;
+}
+
+message ListUserOrdersResponse {
+  repeated Order orders = 1;
+  int32 total = 2;
+}
+
+message GetMarketDataRequest {
+  ContractType contract_type = 1;
+  double strike_hash_rate = 2;
+  int32 start_block_height = 3;
+  int32 end_block_height = 4;
+}
+
+message GetMarketDataResponse {
+  uint64 best_bid = 1;
+  uint64 best_ask = 2;
+  uint64 last_price = 3;
+  uint64 daily_volume = 4;
+  double daily_change = 5;
+  int64 timestamp = 6;
+}
+
+message GetOrderBookEventsRequest {
+  string user_id = 1; // Optional: filter for a specific user's orders
+}
+
+message GetOrderBookEventsResponse {
+  oneof event {
+    OrderCreatedEvent order_created = 1;
+    OrderUpdatedEvent order_updated = 2;
+    TradeExecutedEvent trade_executed = 3;
+  }
+}
+
+message ListTradesRequest {
+  ContractType contract_type = 1;
+  double strike_hash_rate = 2;
+  int32 start_block_height = 3;
+  int32 end_block_height = 4;
+  int32 limit = 5;
+  int32 offset = 6;
+}
+
+message ListTradesResponse {
+  repeated Trade trades = 1;
+  int32 total = 2;
+}

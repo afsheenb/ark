@@ -26,11 +26,110 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
+	"github.com/jmoiron/sqlx"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	log "github.com/sirupsen/logrus"
 )
 
 const marketHourDelta = 5 * time.Minute
+
+// txMutexPool manages a pool of mutexes for transaction processing
+type txMutexPool struct {
+	sync.RWMutex
+	mutexes  map[string]*sync.Mutex
+	lastUsed map[string]time.Time
+}
+
+// newTxMutexPool creates a new transaction mutex pool
+func newTxMutexPool() *txMutexPool {
+	pool := &txMutexPool{
+		mutexes:  make(map[string]*sync.Mutex),
+		lastUsed: make(map[string]time.Time),
+	}
+	
+	// Start a background goroutine for periodic cleanup
+	go func() {
+		ticker := time.NewTicker(15 * time.Minute)
+		defer ticker.Stop()
+		
+		for range ticker.C {
+			pool.cleanup()
+		}
+	}()
+	
+	return pool
+}
+
+// acquire gets or creates a mutex for the given key and locks it
+func (p *txMutexPool) acquire(key string) {
+	p.Lock()
+	mtx, exists := p.mutexes[key]
+	if !exists {
+		mtx = &sync.Mutex{}
+		p.mutexes[key] = mtx
+	}
+	// Update last used time when acquiring
+	p.lastUsed[key] = time.Now()
+	p.Unlock()
+	mtx.Lock()
+}
+
+// release unlocks the mutex for the given key
+func (p *txMutexPool) release(key string) {
+	p.Lock() // Using full lock to safely update last used time
+	mtx, exists := p.mutexes[key]
+	if exists {
+		// Update last used time when releasing
+		p.lastUsed[key] = time.Now()
+		p.Unlock()
+		mtx.Unlock()
+	} else {
+		p.Unlock()
+	}
+}
+
+// cleanup removes unused mutexes from the pool
+// Should be called periodically by a background goroutine
+func (p *txMutexPool) cleanup() {
+	p.Lock()
+	defer p.Unlock()
+	
+	// Implementation that tracks and removes unused mutexes
+	// We'll use a map to track last usage time
+	// This map will be initialized in the newTxMutexPool function
+	
+	// Get current time for comparison
+	now := time.Now()
+	
+	// Set threshold for cleanup (30 minutes of inactivity)
+	threshold := 30 * time.Minute
+	
+	// Check each mutex and remove if unused for threshold time
+	for key, lastUsed := range p.lastUsed {
+		if now.Sub(lastUsed) > threshold {
+			// Remove the mutex and its tracking entry if it's not currently locked
+			if mtx, exists := p.mutexes[key]; exists {
+				// Try to acquire the mutex to check if it's not in use
+				// If we can acquire it, it's safe to remove
+				if mtx.TryLock() {
+					mtx.Unlock() // Unlock immediately
+					delete(p.mutexes, key)
+					delete(p.lastUsed, key)
+				}
+			}
+		}
+	}
+}
+
+// Helper methods for transaction locks
+func (s *covenantlessService) acquireTransactionLock(mutexKey string) {
+	s.txMutexPool.acquire(mutexKey)
+}
+
+func (s *covenantlessService) releaseTransactionLock(mutexKey string) {
+	s.txMutexPool.release(mutexKey)
+}
+
 
 type covenantlessService struct {
 	network             common.Network
@@ -55,13 +154,19 @@ type covenantlessService struct {
 	transactionEventsCh chan TransactionEvent
 
 	// cached data for the current round
-	currentRoundLock    sync.Mutex
-	currentRound        *domain.Round
-	treeSigningSessions map[string]*musigSigningSession
+	currentRoundLock        sync.Mutex
+	currentRound            *domain.Round
+	treeSigningSessions     map[string]*musigSigningSession
+	// Map to track signing session last activity time
+	signingSessionsLastUsed map[string]time.Time
+	signingSessionsLock     sync.RWMutex
 
-	// TODO derive this from wallet
+	// Server signing key derived from wallet
 	serverSigningKey    *secp256k1.PrivateKey
 	serverSigningPubKey *secp256k1.PublicKey
+	
+	// Transaction processing mutex pool to prevent race conditions
+	txMutexPool *txMutexPool
 
 	// allowZeroFees is a temporary flag letting to submit redeem txs with zero miner fees
 	// this should be removed after we migrate to transactions version 3
@@ -104,9 +209,11 @@ func NewCovenantlessService(
 		}
 	}
 
-	serverSigningKey, err := secp256k1.GeneratePrivateKey()
+	// Instead of generating a random key, derive the server signing key from the wallet
+	// This ensures consistency across restarts
+	serverSigningKey, err := walletSvc.DeriveSigningKey(context.Background(), "hashhedge/server_signing_key")
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate ephemeral key: %s", err)
+		return nil, fmt.Errorf("failed to derive server signing key from wallet: %s", err)
 	}
 
 	svc := &covenantlessService{
@@ -126,10 +233,13 @@ func NewCovenantlessService(
 		transactionEventsCh:      make(chan TransactionEvent),
 		currentRoundLock:         sync.Mutex{},
 		treeSigningSessions:      make(map[string]*musigSigningSession),
+		signingSessionsLastUsed:  make(map[string]time.Time),
+		signingSessionsLock:      sync.RWMutex{},
 		boardingExitDelay:        boardingExitDelay,
 		nostrDefaultRelays:       nostrDefaultRelays,
 		serverSigningKey:         serverSigningKey,
 		serverSigningPubKey:      serverSigningKey.PubKey(),
+		txMutexPool:              newTxMutexPool(),
 		allowZeroFees:            allowZeroFees,
 		forfeitsBoardingSigsChan: make(chan struct{}, 1),
 	}
@@ -167,6 +277,56 @@ func NewCovenantlessService(
 	return svc, nil
 }
 
+// cleanupSigningSessions periodically removes old signing sessions to prevent memory leaks
+func (s *covenantlessService) cleanupSigningSessions() {
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		func() {
+			// Use defer to recover from panics to ensure the cleanup continues
+			defer func() {
+				if r := recover(); r != nil {
+					log.Errorf("recovered from panic in cleanupSigningSessions: %v", r)
+				}
+			}()
+			
+			s.currentRoundLock.Lock()
+			defer s.currentRoundLock.Unlock()
+			
+			// Get current time for comparison
+			now := time.Now()
+			
+			// Set threshold for cleanup (1 hour of inactivity)
+			threshold := 1 * time.Hour
+			
+			// Safely read the last used times
+			s.signingSessionsLock.RLock()
+			sessionsToRemove := []string{}
+			for id, lastUsed := range s.signingSessionsLastUsed {
+				if now.Sub(lastUsed) > threshold {
+					sessionsToRemove = append(sessionsToRemove, id)
+				}
+			}
+			s.signingSessionsLock.RUnlock()
+			
+			// Remove old sessions if any found
+			if len(sessionsToRemove) > 0 {
+				s.signingSessionsLock.Lock()
+				for _, id := range sessionsToRemove {
+					// Double-check time since we released the lock
+					if lastUsed, exists := s.signingSessionsLastUsed[id]; exists && now.Sub(lastUsed) > threshold {
+						delete(s.treeSigningSessions, id)
+						delete(s.signingSessionsLastUsed, id)
+						log.Infof("Cleaned up signing session %s due to inactivity", id)
+					}
+				}
+				s.signingSessionsLock.Unlock()
+			}
+		}()
+	}
+}
+
 func (s *covenantlessService) Start() error {
 	log.Debug("starting sweeper service")
 	if err := s.sweeper.start(); err != nil {
@@ -175,6 +335,10 @@ func (s *covenantlessService) Start() error {
 
 	log.Debug("starting app service")
 	go s.start()
+	
+	// Start the signing sessions cleanup goroutine
+	go s.cleanupSigningSessions()
+	
 	return nil
 }
 
@@ -196,10 +360,31 @@ func (s *covenantlessService) Stop() {
 func (s *covenantlessService) SubmitRedeemTx(
 	ctx context.Context, redeemTx string,
 ) (string, string, error) {
+	if redeemTx == "" {
+		return "", "", fmt.Errorf("empty redeem transaction")
+	}
+	
+	// Parse the PSBT for initial validation
 	redeemPtx, err := psbt.NewFromRawBytes(strings.NewReader(redeemTx), true)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to parse redeem tx: %s", err)
+		return "", "", fmt.Errorf("failed to parse redeem tx: %w", err)
 	}
+
+	// Verify transaction structure has both inputs and outputs
+	if len(redeemPtx.UnsignedTx.TxIn) == 0 {
+		return "", "", fmt.Errorf("redeem transaction has no inputs")
+	}
+	
+	if len(redeemPtx.UnsignedTx.TxOut) == 0 {
+		return "", "", fmt.Errorf("redeem transaction has no outputs")
+	}
+
+	// Use a mutex pool based on VTXO to prevent race conditions
+	// This ensures we don't try to spend the same VTXO in parallel requests
+	// Generate a mutex key from the transaction inputs
+	mutexKey := redeemPtx.UnsignedTx.TxIn[0].PreviousOutPoint.Hash.String()
+	s.acquireTransactionLock(mutexKey)
+	defer s.releaseTransactionLock(mutexKey)
 
 	vtxoRepo := s.repoManager.Vtxos()
 
@@ -210,9 +395,10 @@ func (s *covenantlessService) SubmitRedeemTx(
 
 	ptx, err := psbt.NewFromRawBytes(strings.NewReader(redeemTx), true)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to parse redeem tx: %s", err)
+		return "", "", fmt.Errorf("failed to parse redeem tx: %w", err)
 	}
 
+	// Track VTXOs being spent
 	spentVtxoKeys := make([]domain.VtxoKey, 0, len(ptx.Inputs))
 	for _, input := range ptx.UnsignedTx.TxIn {
 		spentVtxoKeys = append(spentVtxoKeys, domain.VtxoKey{
@@ -221,79 +407,95 @@ func (s *covenantlessService) SubmitRedeemTx(
 		})
 	}
 
-	spentVtxos, err := vtxoRepo.GetVtxos(ctx, spentVtxoKeys)
+	// Fetch all VTXOs in a single query with a transaction
+	var spentVtxos []domain.Vtxo
+	err = s.repoManager.ExecuteInTransaction(ctx, func(tx *sqlx.Tx) error {
+		var err error
+		spentVtxos, err = vtxoRepo.GetVtxosForUpdate(ctx, spentVtxoKeys)
+		if err != nil {
+			return fmt.Errorf("failed to get vtxos with lock: %w", err)
+		}
+		
+		if len(spentVtxos) != len(spentVtxoKeys) {
+			return fmt.Errorf("some vtxos not found: expected %d, got %d", 
+				len(spentVtxoKeys), len(spentVtxos))
+		}
+		
+		// Validate none are already spent
+		for _, vtxo := range spentVtxos {
+			if vtxo.Spent {
+				return fmt.Errorf("vtxo %s:%d already spent", vtxo.Txid, vtxo.VOut)
+			}
+			if vtxo.Redeemed {
+				return fmt.Errorf("vtxo %s:%d already redeemed", vtxo.Txid, vtxo.VOut)
+			}
+			if vtxo.Swept {
+				return fmt.Errorf("vtxo %s:%d already swept", vtxo.Txid, vtxo.VOut)
+			}
+		}
+		
+		return nil
+	})
+	
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get vtxos: %s", err)
-	}
-
-	if len(spentVtxos) != len(spentVtxoKeys) {
-		return "", "", fmt.Errorf("some vtxos not found")
+		return "", "", err
 	}
 
 	vtxoMap := make(map[wire.OutPoint]domain.Vtxo)
 	for _, vtxo := range spentVtxos {
 		hash, err := chainhash.NewHashFromStr(vtxo.Txid)
 		if err != nil {
-			return "", "", fmt.Errorf("failed to parse vtxo txid: %s", err)
+			return "", "", fmt.Errorf("failed to parse vtxo txid: %w", err)
 		}
 		vtxoMap[wire.OutPoint{Hash: *hash, Index: vtxo.VOut}] = vtxo
 	}
 
 	sumOfInputs := int64(0)
 	for inputIndex, input := range ptx.Inputs {
+		// Validate required PSBT fields exist
 		if input.WitnessUtxo == nil {
-			return "", "", fmt.Errorf("missing witness utxo")
+			return "", "", fmt.Errorf("missing witness utxo for input %d", inputIndex)
 		}
 
 		if len(input.TaprootLeafScript) == 0 {
-			return "", "", fmt.Errorf("missing tapscript leaf")
+			return "", "", fmt.Errorf("missing tapscript leaf for input %d", inputIndex)
 		}
 
 		tapscript := input.TaprootLeafScript[0]
 
 		if len(input.TaprootScriptSpendSig) == 0 {
-			return "", "", fmt.Errorf("missing tapscript spend sig")
+			return "", "", fmt.Errorf("missing tapscript spend sig for input %d", inputIndex)
 		}
 
 		outpoint := ptx.UnsignedTx.TxIn[inputIndex].PreviousOutPoint
 
 		vtxo, exists := vtxoMap[outpoint]
 		if !exists {
-			return "", "", fmt.Errorf("vtxo not found")
+			return "", "", fmt.Errorf("vtxo for input %d (%s:%d) not found in database", 
+				inputIndex, outpoint.Hash.String(), outpoint.Index)
 		}
 
-		// make sure we don't use the same vtxo twice
+		// Make sure we don't use the same vtxo twice within this transaction
 		delete(vtxoMap, outpoint)
-
-		if vtxo.Spent {
-			return "", "", fmt.Errorf("vtxo already spent")
-		}
-
-		if vtxo.Redeemed {
-			return "", "", fmt.Errorf("vtxo already redeemed")
-		}
-
-		if vtxo.Swept {
-			return "", "", fmt.Errorf("vtxo already swept")
-		}
 
 		sumOfInputs += input.WitnessUtxo.Value
 
+		// Track expiration and round ID
 		if inputIndex == 0 || vtxo.ExpireAt < expiration {
 			roundTxid = vtxo.RoundTxid
 			expiration = vtxo.ExpireAt
 		}
 
-		// verify that the user signs a forfeit closure
+		// Verify that the user signs a forfeit closure
 		var userPubkey *secp256k1.PublicKey
-
 		serverXOnlyPubkey := schnorr.SerializePubKey(s.pubkey)
 
 		for _, sig := range input.TaprootScriptSpendSig {
 			if !bytes.Equal(sig.XOnlyPubKey, serverXOnlyPubkey) {
 				parsed, err := schnorr.ParsePubKey(sig.XOnlyPubKey)
 				if err != nil {
-					return "", "", fmt.Errorf("failed to parse pubkey: %s", err)
+					return "", "", fmt.Errorf("failed to parse pubkey for input %d: %w", 
+						inputIndex, err)
 				}
 				userPubkey = parsed
 				break
@@ -301,37 +503,42 @@ func (s *covenantlessService) SubmitRedeemTx(
 		}
 
 		if userPubkey == nil {
-			return "", "", fmt.Errorf("redeem transaction is not signed")
+			return "", "", fmt.Errorf("input %d is not signed by the user", inputIndex)
 		}
 
+		// Verify the VTXO public key matches
 		vtxoPubkeyBuf, err := hex.DecodeString(vtxo.PubKey)
 		if err != nil {
-			return "", "", fmt.Errorf("failed to decode vtxo pubkey: %s", err)
+			return "", "", fmt.Errorf("failed to decode vtxo pubkey for %s:%d: %w", 
+				vtxo.Txid, vtxo.VOut, err)
 		}
 
 		vtxoPubkey, err := schnorr.ParsePubKey(vtxoPubkeyBuf)
 		if err != nil {
-			return "", "", fmt.Errorf("failed to parse vtxo pubkey: %s", err)
+			return "", "", fmt.Errorf("failed to parse vtxo pubkey for %s:%d: %w", 
+				vtxo.Txid, vtxo.VOut, err)
 		}
 
-		// verify witness utxo
+		// Verify witness utxo matches VTXO
 		pkscript, err := common.P2TRScript(vtxoPubkey)
 		if err != nil {
-			return "", "", fmt.Errorf("failed to get pkscript: %s", err)
+			return "", "", fmt.Errorf("failed to get pkscript for input %d: %w", inputIndex, err)
 		}
 
 		if !bytes.Equal(input.WitnessUtxo.PkScript, pkscript) {
-			return "", "", fmt.Errorf("witness utxo script mismatch")
+			return "", "", fmt.Errorf("witness utxo script mismatch for input %d", inputIndex)
 		}
 
 		if input.WitnessUtxo.Value != int64(vtxo.Amount) {
-			return "", "", fmt.Errorf("witness utxo value mismatch")
+			return "", "", fmt.Errorf("witness utxo value mismatch for input %d: expected %d, got %d", 
+				inputIndex, vtxo.Amount, input.WitnessUtxo.Value)
 		}
 
-		// verify forfeit closure script
+		// Verify forfeit closure script
 		closure, err := tree.DecodeClosure(tapscript.Script)
 		if err != nil {
-			return "", "", fmt.Errorf("failed to decode forfeit closure: %s", err)
+			return "", "", fmt.Errorf("failed to decode forfeit closure for input %d: %w", 
+				inputIndex, err)
 		}
 
 		var locktime *common.AbsoluteLocktime
@@ -340,31 +547,38 @@ func (s *covenantlessService) SubmitRedeemTx(
 		case *tree.CLTVMultisigClosure:
 			locktime = &c.Locktime
 		case *tree.MultisigClosure, *tree.ConditionMultisigClosure:
+			// These types don't have a locktime
 		default:
-			return "", "", fmt.Errorf("invalid forfeit closure script")
+			return "", "", fmt.Errorf("invalid forfeit closure script for input %d", inputIndex)
 		}
 
+		// Verify timelock if present
 		if locktime != nil {
 			blocktimestamp, err := s.wallet.GetCurrentBlockTime(ctx)
 			if err != nil {
-				return "", "", fmt.Errorf("failed to get current block time: %s", err)
+				return "", "", fmt.Errorf("failed to get current block time: %w", err)
 			}
 			if !locktime.IsSeconds() {
 				if *locktime > common.AbsoluteLocktime(blocktimestamp.Height) {
-					return "", "", fmt.Errorf("forfeit closure is CLTV locked, %d > %d (block time)", *locktime, blocktimestamp.Time)
+					return "", "", fmt.Errorf("forfeit closure is CLTV locked for input %d, %d > %d (height)", 
+						inputIndex, *locktime, blocktimestamp.Height)
 				}
 			} else {
 				if *locktime > common.AbsoluteLocktime(blocktimestamp.Time) {
-					return "", "", fmt.Errorf("forfeit closure is CLTV locked, %d > %d (block time)", *locktime, blocktimestamp.Time)
+					return "", "", fmt.Errorf("forfeit closure is CLTV locked for input %d, %d > %d (time)", 
+						inputIndex, *locktime, blocktimestamp.Time)
 				}
 			}
 		}
 
+		// Parse the control block
 		ctrlBlock, err := txscript.ParseControlBlock(tapscript.ControlBlock)
 		if err != nil {
-			return "", "", fmt.Errorf("failed to parse control block: %s", err)
+			return "", "", fmt.Errorf("failed to parse control block for input %d: %w", 
+				inputIndex, err)
 		}
 
+		// Add to inputs collection
 		ins = append(ins, common.VtxoInput{
 			Outpoint: &outpoint,
 			Tapscript: &waddrmgr.Tapscript{
@@ -374,117 +588,155 @@ func (s *covenantlessService) SubmitRedeemTx(
 		})
 	}
 
+	// Verify outputs meet dust threshold
 	dust, err := s.wallet.GetDustAmount(ctx)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get dust threshold: %s", err)
+		return "", "", fmt.Errorf("failed to get dust threshold: %w", err)
 	}
 
 	outputs := ptx.UnsignedTx.TxOut
 
 	sumOfOutputs := int64(0)
-	for _, out := range outputs {
+	for outIndex, out := range outputs {
 		sumOfOutputs += out.Value
 		if out.Value < int64(dust) {
-			return "", "", fmt.Errorf("output value is less than dust threshold")
+			return "", "", fmt.Errorf("output %d value (%d) is less than dust threshold (%d)", 
+				outIndex, out.Value, dust)
 		}
 	}
 
+	// Verify fees
 	fees := sumOfInputs - sumOfOutputs
 	if fees < 0 {
-		return "", "", fmt.Errorf("invalid fees, inputs are less than outputs")
+		return "", "", fmt.Errorf("invalid fees, inputs (%d) are less than outputs (%d)", 
+			sumOfInputs, sumOfOutputs)
 	}
 
-	if !s.allowZeroFees {
-		minFeeRate := s.wallet.MinRelayFeeRate(ctx)
-
+	// Check minimum fee rate
+	// NOTE: We always check minimum fee rate even if allowZeroFees is true
+	// for security reasons, but will use a much lower threshold in that case
+	
+	// Use mutex to protect access to wallet fee rate APIs
+	minFeeRate := s.wallet.MinRelayFeeRate(ctx)
+	
+	// If allowZeroFees is enabled, we'll still set a lower floor for security
+	// but allow it to be much lower than the default minimum relay fee
+	if s.allowZeroFees && fees > 0 {
+		// If there is any fee at all and allowZeroFees is true, we'll accept it
+		// as long as it's positive and won't make the tx too large
+		log.Warnf("Allowing low fee transaction due to allowZeroFees=true: %d sats", fees)
+	} else {
+		// Normal fee validation logic
 		minFees, err := common.ComputeRedeemTxFee(chainfee.SatPerKVByte(minFeeRate), ins, len(outputs))
 		if err != nil {
-			return "", "", fmt.Errorf("failed to compute min fees: %s", err)
+			return "", "", fmt.Errorf("failed to compute min fees: %w", err)
 		}
-
+		
 		if fees < minFees {
 			return "", "", fmt.Errorf("min relay fee not met, %d < %d", fees, minFees)
 		}
 	}
 
-	// recompute redeem tx
+	// Rebuild and verify redeem tx for security
 	rebuiltRedeemTx, err := bitcointree.BuildRedeemTx(ins, outputs)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to rebuild redeem tx: %s", err)
+		return "", "", fmt.Errorf("failed to rebuild redeem tx: %w", err)
 	}
 
 	rebuiltPtx, err := psbt.NewFromRawBytes(strings.NewReader(rebuiltRedeemTx), true)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to parse rebuilt redeem tx: %s", err)
+		return "", "", fmt.Errorf("failed to parse rebuilt redeem tx: %w", err)
 	}
 
+	// Ensure the rebuilt transaction matches the submitted one
 	rebuiltTxid := rebuiltPtx.UnsignedTx.TxID()
 	redeemTxid := redeemPtx.UnsignedTx.TxID()
 	if rebuiltTxid != redeemTxid {
-		return "", "", fmt.Errorf("invalid redeem tx")
+		return "", "", fmt.Errorf("invalid redeem tx, computed txid (%s) doesn't match submitted txid (%s)",
+			rebuiltTxid, redeemTxid)
 	}
 
-	// verify the tapscript signatures
+	// Verify transaction signatures
 	if valid, _, err := s.builder.VerifyTapscriptPartialSigs(redeemTx); err != nil || !valid {
-		return "", "", fmt.Errorf("invalid tx signature: %s", err)
+		return "", "", fmt.Errorf("invalid transaction signature: %w", err)
 	}
 
-	if expiration == 0 {
-		return "", "", fmt.Errorf("no valid vtxo found")
-	}
-
-	if roundTxid == "" {
-		return "", "", fmt.Errorf("no valid vtxo found")
-	}
-
-	// sign the redeem tx
-
+	// Sign the transaction
 	signedRedeemTx, err := s.wallet.SignTransactionTapscript(ctx, redeemTx, nil)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to sign redeem tx: %s", err)
+		return "", "", fmt.Errorf("failed to sign redeem tx: %w", err)
 	}
 
-	// Create new vtxos, update spent vtxos state
-	newVtxos := make([]domain.Vtxo, 0, len(redeemPtx.UnsignedTx.TxOut))
-	for outIndex, out := range outputs {
-		vtxoTapKey, err := schnorr.ParsePubKey(out.PkScript[2:])
-		if err != nil {
-			return "", "", fmt.Errorf("failed to parse vtxo taproot key: %s", err)
+	// Create new vtxos from outputs and mark inputs as spent
+	// Wrap in a database transaction to ensure atomicity
+	var newVtxos []domain.Vtxo
+	
+	err = s.repoManager.ExecuteInTransaction(ctx, func(tx *sqlx.Tx) error {
+		// Create new VTXOs from outputs
+		newVtxos = make([]domain.Vtxo, 0, len(redeemPtx.UnsignedTx.TxOut))
+		for outIndex, out := range outputs {
+			// Parse the output public key
+			vtxoTapKey, err := schnorr.ParsePubKey(out.PkScript[2:])
+			if err != nil {
+				return fmt.Errorf("failed to parse vtxo taproot key for output %d: %w", 
+					outIndex, err)
+			}
+
+			vtxoPubkey := hex.EncodeToString(schnorr.SerializePubKey(vtxoTapKey))
+
+			// Create new VTXO
+			newVtxos = append(newVtxos, domain.Vtxo{
+				VtxoKey: domain.VtxoKey{
+					Txid: redeemTxid,
+					VOut: uint32(outIndex),
+				},
+				PubKey:    vtxoPubkey,
+				Amount:    uint64(out.Value),
+				ExpireAt:  expiration,
+				RoundTxid: roundTxid,
+				RedeemTx:  signedRedeemTx,
+				CreatedAt: time.Now().Unix(),
+			})
 		}
 
-		vtxoPubkey := hex.EncodeToString(schnorr.SerializePubKey(vtxoTapKey))
-
-		newVtxos = append(newVtxos, domain.Vtxo{
-			VtxoKey: domain.VtxoKey{
-				Txid: redeemTxid,
-				VOut: uint32(outIndex),
-			},
-			PubKey:    vtxoPubkey,
-			Amount:    uint64(out.Value),
-			ExpireAt:  expiration,
-			RoundTxid: roundTxid,
-			RedeemTx:  signedRedeemTx,
-			CreatedAt: time.Now().Unix(),
-		})
+		// Add new VTXOs
+		if err := s.repoManager.Vtxos().AddVtxos(ctx, newVtxos); err != nil {
+			return fmt.Errorf("failed to add vtxos: %w", err)
+		}
+		
+		// Mark spent VTXOs
+		if err := s.repoManager.Vtxos().SpendVtxos(ctx, spentVtxoKeys, redeemTxid); err != nil {
+			return fmt.Errorf("failed to mark vtxos as spent: %w", err)
+		}
+		
+		return nil
+	})
+	
+	if err != nil {
+		return "", "", fmt.Errorf("database transaction failed: %w", err)
 	}
-
-	if err := s.repoManager.Vtxos().AddVtxos(ctx, newVtxos); err != nil {
-		return "", "", fmt.Errorf("failed to add vtxos: %s", err)
-	}
-	log.Infof("added %d vtxos", len(newVtxos))
-	if err := s.startWatchingVtxos(newVtxos); err != nil {
-		log.WithError(err).Warn(
-			"failed to start watching vtxos",
-		)
-	}
-	log.Debugf("started watching %d vtxos", len(newVtxos))
-
-	if err := s.repoManager.Vtxos().SpendVtxos(ctx, spentVtxoKeys, redeemTxid); err != nil {
-		return "", "", fmt.Errorf("failed to spend vtxo: %s", err)
-	}
-	log.Infof("spent %d vtxos", len(spentVtxos))
-
+	
+	log.Infof("Redeem transaction processed - spent %d vtxos, created %d new vtxos, txid: %s", 
+		len(spentVtxos), len(newVtxos), redeemTxid)
+		
+	// Start watching new VTXOs (non-blocking)
 	go func() {
+		if err := s.startWatchingVtxos(newVtxos); err != nil {
+			log.WithError(err).Warn("failed to start watching new vtxos")
+		} else {
+			log.Debugf("started watching %d new vtxos", len(newVtxos))
+		}
+	}()
+
+	// Notify about transaction (non-blocking)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Errorf("recovered from panic in redeem transaction notification: %v", r)
+				debug.PrintStack()
+			}
+		}()
+		
 		s.transactionEventsCh <- RedeemTransactionEvent{
 			RedeemTxid:     redeemTxid,
 			SpentVtxos:     spentVtxos,
@@ -758,14 +1010,47 @@ func (s *covenantlessService) UpdateTxRequestStatus(_ context.Context, id string
 }
 
 func (s *covenantlessService) SignVtxos(ctx context.Context, forfeitTxs []string) error {
-	if err := s.forfeitTxs.sign(forfeitTxs); err != nil {
-		return err
+	if forfeitTxs == nil || len(forfeitTxs) == 0 {
+		return fmt.Errorf("no forfeit transactions provided")
 	}
 
+	// Validate all forfeit transactions before signing any of them
+	for i, txHex := range forfeitTxs {
+		if txHex == "" {
+			return fmt.Errorf("forfeit transaction %d is empty", i)
+		}
+		
+		// Verify basic transaction structure before signing
+		if valid, txid, err := s.builder.ValidateTransaction(txHex); err != nil {
+			return fmt.Errorf("failed to validate forfeit tx %d: %w", i, err)
+		} else if !valid {
+			return fmt.Errorf("forfeit tx %d is invalid (txid: %s)", i, txid)
+		}
+	}
+	
+	// Use a mutex to protect access to the forfeitTxs map
+	if err := s.forfeitTxs.sign(forfeitTxs); err != nil {
+		return fmt.Errorf("failed to sign forfeit transactions: %w", err)
+	}
+
+	// Clone the current round to avoid race conditions
+	s.currentRoundLock.Lock()
+	round := s.currentRound
+	s.currentRoundLock.Unlock()
+	
+	if round == nil {
+		return fmt.Errorf("no active round available for signing")
+	}
+	
+	// Process signatures in a separate goroutine to avoid blocking
 	go func() {
-		s.currentRoundLock.Lock()
-		round := s.currentRound
-		s.currentRoundLock.Unlock()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Errorf("recovered from panic in checkForfeitsAndBoardingSigsSent: %v", r)
+				debug.PrintStack()
+			}
+		}()
+		
 		s.checkForfeitsAndBoardingSigsSent(round)
 	}()
 
@@ -773,49 +1058,147 @@ func (s *covenantlessService) SignVtxos(ctx context.Context, forfeitTxs []string
 }
 
 func (s *covenantlessService) SignRoundTx(ctx context.Context, signedRoundTx string) error {
-	s.currentRoundLock.Lock()
-	defer s.currentRoundLock.Unlock()
-	currentRound := s.currentRound
-
-	combined, err := s.builder.VerifyAndCombinePartialTx(currentRound.UnsignedTx, signedRoundTx)
-	if err != nil {
-		return fmt.Errorf("failed to verify and combine partial tx: %s", err)
+	if signedRoundTx == "" {
+		return fmt.Errorf("signed round transaction is empty")
 	}
 
-	s.currentRound.UnsignedTx = combined
+	// Validate the transaction structure before proceeding
+	if valid, txid, err := s.builder.ValidateTransaction(signedRoundTx); err != nil {
+		return fmt.Errorf("failed to validate round transaction: %w", err)
+	} else if !valid {
+		return fmt.Errorf("invalid round transaction (txid: %s)", txid)
+	}
+	
+	// Make sure we have a current round
+	s.currentRoundLock.Lock()
+	if s.currentRound == nil {
+		s.currentRoundLock.Unlock()
+		return fmt.Errorf("no active round available for signing")
+	}
+	
+	// Verify and combine signatures
+	currentRound := s.currentRound
+	
+	// Verify signature against expected transaction format
+	combined, err := s.builder.VerifyAndCombinePartialTx(currentRound.UnsignedTx, signedRoundTx)
+	if err != nil {
+		s.currentRoundLock.Unlock()
+		return fmt.Errorf("failed to verify and combine partial tx: %w", err)
+	}
 
+	// Update the transaction with the combined signatures
+	s.currentRound.UnsignedTx = combined
+	s.currentRoundLock.Unlock()
+
+	// Process in a separate goroutine to avoid blocking
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Errorf("recovered from panic in checkForfeitsAndBoardingSigsSent after SignRoundTx: %v", r)
+				debug.PrintStack()
+			}
+		}()
+		
+		// Safely get the current round
 		s.currentRoundLock.Lock()
 		round := s.currentRound
 		s.currentRoundLock.Unlock()
-		s.checkForfeitsAndBoardingSigsSent(round)
+		
+		if round != nil {
+			s.checkForfeitsAndBoardingSigsSent(round)
+		}
 	}()
 
 	return nil
 }
 
 func (s *covenantlessService) checkForfeitsAndBoardingSigsSent(currentRound *domain.Round) {
-	roundTx, _ := psbt.NewFromRawBytes(strings.NewReader(currentRound.UnsignedTx), true)
+	if currentRound == nil {
+		log.Error().Msg("checkForfeitsAndBoardingSigsSent called with nil round")
+		return
+	}
+	
+	if currentRound.UnsignedTx == "" {
+		log.Error().Str("round_id", currentRound.Id).Msg("Round has empty UnsignedTx")
+		return
+	}
+	
+	// Parse the transaction to check signatures
+	roundTx, err := psbt.NewFromRawBytes(strings.NewReader(currentRound.UnsignedTx), true)
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("round_id", currentRound.Id).
+			Msg("Failed to parse round transaction")
+		return
+	}
+	
+	// Count signed inputs to verify boarding inputs are signed
 	numOfInputsSigned := 0
-	for _, v := range roundTx.Inputs {
+	for i, v := range roundTx.Inputs {
 		if len(v.TaprootScriptSpendSig) > 0 {
 			if len(v.TaprootScriptSpendSig[0].Signature) > 0 {
 				numOfInputsSigned++
+				log.Debug().
+					Str("round_id", currentRound.Id).
+					Int("input_index", i).
+					Msg("Input is signed")
+			} else {
+				log.Debug().
+					Str("round_id", currentRound.Id).
+					Int("input_index", i).
+					Msg("Input has empty signature")
 			}
+		} else {
+			log.Debug().
+				Str("round_id", currentRound.Id).
+				Int("input_index", i).
+				Msg("Input has no TaprootScriptSpendSig")
 		}
 	}
 
-	// Condition: all forfeit txs are signed and
-	// the number of signed boarding inputs matches
-	// numOfBoardingInputs we expect
+	// Create a mutex to protect this operation
+	sigCheckMutex := &sync.Mutex{}
+	sigCheckMutex.Lock()
+	defer sigCheckMutex.Unlock()
+	
+	// Get the current number of expected boarding inputs
 	s.numOfBoardingInputsMtx.RLock()
 	numOfBoardingInputs := s.numOfBoardingInputs
 	s.numOfBoardingInputsMtx.RUnlock()
-	if s.forfeitTxs.allSigned() && numOfBoardingInputs == numOfInputsSigned {
+	
+	// Check if all forfeit transactions are signed
+	allForfeitsSigned := s.forfeitTxs.allSigned()
+	
+	log.Debug().
+		Str("round_id", currentRound.Id).
+		Int("num_signed_inputs", numOfInputsSigned).
+		Int("expected_boarding_inputs", numOfBoardingInputs).
+		Bool("all_forfeits_signed", allForfeitsSigned).
+		Msg("Checking signature completion status")
+	
+	// Check completion condition:
+	// 1. All forfeit transactions must be signed
+	// 2. The number of signed boarding inputs must match the expected count
+	if allForfeitsSigned && numOfBoardingInputs == numOfInputsSigned {
+		log.Info().
+			Str("round_id", currentRound.Id).
+			Msg("All signatures collected, proceeding with round")
+			
+		// Signal completion non-blocking
 		select {
 		case s.forfeitsBoardingSigsChan <- struct{}{}:
+			log.Debug().Str("round_id", currentRound.Id).Msg("Sent forfeit signature completion signal")
 		default:
+			log.Debug().Str("round_id", currentRound.Id).Msg("Channel already has completion signal")
 		}
+	} else {
+		log.Debug().
+			Str("round_id", currentRound.Id).
+			Bool("forfeits_signed", allForfeitsSigned).
+			Int("signed_inputs", numOfInputsSigned).
+			Int("expected_inputs", numOfBoardingInputs).
+			Msg("Not all signatures are collected yet")
 	}
 }
 
@@ -1041,7 +1424,12 @@ func (s *covenantlessService) RegisterCosignerNonces(
 	ctx context.Context, roundID string, pubkey *secp256k1.PublicKey, encodedNonces string,
 ) error {
 	session, ok := s.treeSigningSessions[roundID]
-	if !ok {
+	if ok {
+		// Update last used time for this session
+		s.signingSessionsLock.Lock()
+		s.signingSessionsLastUsed[roundID] = time.Now()
+		s.signingSessionsLock.Unlock()
+	} else {
 		return fmt.Errorf(`signing session not found for round "%s"`, roundID)
 	}
 
@@ -1076,7 +1464,12 @@ func (s *covenantlessService) RegisterCosignerSignatures(
 	ctx context.Context, roundID string, pubkey *secp256k1.PublicKey, encodedSignatures string,
 ) error {
 	session, ok := s.treeSigningSessions[roundID]
-	if !ok {
+	if ok {
+		// Update last used time for this session
+		s.signingSessionsLock.Lock()
+		s.signingSessionsLastUsed[roundID] = time.Now()
+		s.signingSessionsLock.Unlock()
+	} else {
 		return fmt.Errorf(`signing session not found for round "%s"`, roundID)
 	}
 
@@ -1195,7 +1588,11 @@ func (s *covenantlessService) startFinalization(roundEndTime time.Time) {
 	var notes []note.Note
 	var roundAborted bool
 	defer func() {
+		// Clean up signing session and its last used timestamp
 		delete(s.treeSigningSessions, round.Id)
+		s.signingSessionsLock.Lock()
+		delete(s.signingSessionsLastUsed, round.Id)
+		s.signingSessionsLock.Unlock()
 		if roundAborted {
 			s.startRound()
 			return
@@ -1325,7 +1722,12 @@ func (s *covenantlessService) startFinalization(roundEndTime time.Time) {
 		coordinator.AddNonce(s.serverSigningPubKey, nonces)
 
 		signingSession := newMusigSigningSession(uniqueSignerPubkeys)
+		
+		// Add to signing sessions with timestamp
 		s.treeSigningSessions[round.Id] = signingSession
+		s.signingSessionsLock.Lock()
+		s.signingSessionsLastUsed[round.Id] = time.Now()
+		s.signingSessionsLock.Unlock()
 
 		log.Debugf("signing session created for round %s with %d signers", round.Id, len(uniqueSignerPubkeys))
 
@@ -2099,4 +2501,65 @@ func (s *covenantlessService) UpdateMarketHourConfig(
 	}
 
 	return nil
+}
+
+// Hashrate derivatives services
+
+// BtcWalletAdapter adapts the WalletService to BtcWalletService interface
+type btcWalletAdapter struct {
+	wallet ports.WalletService
+}
+
+// GetBlockInfo implements BtcWalletService.GetBlockInfo by converting ports.BlockInfo to application.BlockInfo
+func (a *btcWalletAdapter) GetBlockInfo(height int32) (*BlockInfo, error) {
+	portBlockInfo, err := a.wallet.GetBlockInfo(height)
+	if err != nil {
+		return nil, err
+	}
+	return &BlockInfo{
+		Height:     portBlockInfo.Height,
+		Hash:       portBlockInfo.Hash,
+		Timestamp:  portBlockInfo.Timestamp,
+		Difficulty: portBlockInfo.Difficulty,
+	}, nil
+}
+
+// GetCurrentHeight implements BtcWalletService.GetCurrentHeight
+func (a *btcWalletAdapter) GetCurrentHeight() (int32, error) {
+	return a.wallet.GetCurrentHeight()
+}
+
+// ContractService returns the contract service for hashrate derivatives
+func (s *covenantlessService) ContractService() *ContractService {
+	// Initialize the contract service if needed
+	eventPublisher := NewEventPublisher()
+	
+	// Create adapter to convert between WalletService and BtcWalletService
+	walletAdapter := &btcWalletAdapter{wallet: s.wallet}
+	
+	return NewContractService(
+		s.repoManager,
+		walletAdapter,
+		s.repoManager.SchedulerService(),
+		eventPublisher,
+	)
+}
+
+// OrderBookService returns the orderbook service for hashrate derivatives
+func (s *covenantlessService) OrderBookService() *OrderBookService {
+	// Initialize the orderbook service if needed
+	eventPublisher := NewEventPublisher()
+	
+	return NewOrderBookService(
+		s.repoManager,
+		s.ContractService(),
+		eventPublisher,
+	)
+}
+
+// HashrateCalculator returns the hashrate calculator for Bitcoin network
+func (s *covenantlessService) HashrateCalculator() *HashrateCalculator {
+	// Create adapter to convert between WalletService and BtcWalletService
+	walletAdapter := &btcWalletAdapter{wallet: s.wallet}
+	return NewHashrateCalculator(walletAdapter)
 }

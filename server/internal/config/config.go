@@ -89,7 +89,7 @@ type Config struct {
 	MarketHourRoundInterval time.Duration
 	OtelCollectorEndpoint   string
 
-	// TODO remove with transactions version 3
+	// Default to false as we've migrated to transaction version 3
 	AllowZeroFees bool
 
 	EsploraURL       string

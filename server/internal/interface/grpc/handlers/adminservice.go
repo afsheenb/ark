@@ -14,6 +14,7 @@ import (
 )
 
 type adminHandler struct {
+	arkv1.UnimplementedAdminServiceServer
 	adminService application.AdminService
 	arkService   application.Service
 
@@ -23,7 +24,12 @@ type adminHandler struct {
 func NewAdminHandler(
 	adminService application.AdminService, arkService application.Service, noteUriPrefix string,
 ) arkv1.AdminServiceServer {
-	return &adminHandler{adminService, arkService, noteUriPrefix}
+	return &adminHandler{
+		UnimplementedAdminServiceServer: arkv1.UnimplementedAdminServiceServer{},
+		adminService:                   adminService,
+		arkService:                     arkService,
+		noteUriPrefix:                  noteUriPrefix,
+	}
 }
 
 func (a *adminHandler) GetRoundDetails(ctx context.Context, req *arkv1.GetRoundDetailsRequest) (*arkv1.GetRoundDetailsResponse, error) {

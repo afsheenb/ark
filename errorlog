@@ -1,0 +1,2 @@
+116.6 internal/interface/grpc/service.go:314:19: undefined: arkv1.RegisterContractServiceHandler
+116.6 internal/interface/grpc/service.go:319:19: undefined: arkv1.RegisterOrderBookServiceHandler

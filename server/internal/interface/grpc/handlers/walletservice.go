@@ -10,6 +10,7 @@ import (
 )
 
 type walletInitHandler struct {
+	arkv1.UnimplementedWalletInitializerServiceServer
 	walletService ports.WalletService
 	onInit        func(password string)
 	onUnlock      func(password string)
@@ -19,7 +20,12 @@ type walletInitHandler struct {
 func NewWalletInitializerHandler(
 	walletService ports.WalletService, onInit, onUnlock func(string), onReady func(),
 ) arkv1.WalletInitializerServiceServer {
-	svc := walletInitHandler{walletService, onInit, onUnlock, onReady}
+	svc := walletInitHandler{
+		walletService: walletService,
+		onInit:        onInit,
+		onUnlock:      onUnlock,
+		onReady:       onReady,
+	}
 	go svc.listenWhenReady()
 	return &svc
 }
@@ -122,11 +128,14 @@ func (a *walletInitHandler) listenWhenReady() {
 }
 
 type walletHandler struct {
+	arkv1.UnimplementedWalletServiceServer
 	walletService ports.WalletService
 }
 
 func NewWalletHandler(walletService ports.WalletService) arkv1.WalletServiceServer {
-	return &walletHandler{walletService}
+	return &walletHandler{
+		walletService: walletService,
+	}
 }
 
 func (a *walletHandler) Lock(ctx context.Context, req *arkv1.LockRequest) (*arkv1.LockResponse, error) {

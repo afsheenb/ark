@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"embed"
 	"errors"
 	"fmt"
@@ -58,12 +59,17 @@ type ServiceConfig struct {
 }
 
 type service struct {
-	eventStore     domain.RoundEventRepository
-	roundStore     domain.RoundRepository
-	vtxoStore      domain.VtxoRepository
-	noteStore      domain.NoteRepository
-	entityStore    domain.EntityRepository
-	marketHourRepo domain.MarketHourRepo
+	eventStore         domain.RoundEventRepository
+	roundStore         domain.RoundRepository
+	vtxoStore          domain.VtxoRepository
+	noteStore          domain.NoteRepository
+	entityStore        domain.EntityRepository
+	marketHourRepo     domain.MarketHourRepo
+	contractRepository domain.ContractRepository
+	hashrateRepository domain.HashrateRepository
+	orderRepository    domain.OrderRepository
+	tradeRepository    domain.TradeRepository
+	sqliteDB           *sql.DB // Store the database connection for later use
 }
 
 func NewService(config ServiceConfig) (ports.RepoManager, error) {
@@ -98,6 +104,11 @@ func NewService(config ServiceConfig) (ports.RepoManager, error) {
 	var noteStore domain.NoteRepository
 	var entityStore domain.EntityRepository
 	var marketHourRepo domain.MarketHourRepo
+	var contractRepository domain.ContractRepository
+	var hashrateRepository domain.HashrateRepository
+	var orderRepository domain.OrderRepository
+	var tradeRepository domain.TradeRepository
+	var sqliteDB *sql.DB
 	var err error
 
 	switch config.EventStoreType {
@@ -147,6 +158,9 @@ func NewService(config ServiceConfig) (ports.RepoManager, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to open db: %s", err)
 		}
+		
+		// Store DB connection for later use
+		sqliteDB = db
 
 		driver, err := sqlitemigrate.WithInstance(db, &sqlitemigrate.Config{})
 		if err != nil {
@@ -183,20 +197,30 @@ func NewService(config ServiceConfig) (ports.RepoManager, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to open note store: %s", err)
 		}
-
 		marketHourRepo, err = marketHourStoreFactory(db)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create market hour store: %w", err)
 		}
+		
+		// Initialize hashrate derivatives repositories
+		contractRepository = sqlitedb.NewContractRepository(db)
+		hashrateRepository = sqlitedb.NewHashrateRepository(db)
+		orderRepository = sqlitedb.NewOrderRepository(db)
+		tradeRepository = sqlitedb.NewTradeRepository(db)
 	}
 
 	return &service{
-		eventStore:     eventStore,
-		roundStore:     roundStore,
-		vtxoStore:      vtxoStore,
-		noteStore:      noteStore,
-		entityStore:    entityStore,
-		marketHourRepo: marketHourRepo,
+		eventStore:         eventStore,
+		roundStore:         roundStore,
+		vtxoStore:          vtxoStore,
+		noteStore:          noteStore,
+		entityStore:        entityStore,
+		marketHourRepo:     marketHourRepo,
+		contractRepository: contractRepository,
+		hashrateRepository: hashrateRepository,
+		orderRepository:    orderRepository,
+		tradeRepository:    tradeRepository,
+		sqliteDB:           sqliteDB,
 	}, nil
 }
 
@@ -228,10 +252,38 @@ func (s *service) MarketHourRepo() domain.MarketHourRepo {
 	return s.marketHourRepo
 }
 
+func (s *service) ContractRepository() domain.ContractRepository {
+	return s.contractRepository
+}
+
+func (s *service) HashrateRepository() domain.HashrateRepository {
+	return s.hashrateRepository
+}
+
+func (s *service) OrderRepository() domain.OrderRepository {
+	return s.orderRepository
+}
+
+func (s *service) TradeRepository() domain.TradeRepository {
+	return s.tradeRepository
+}
+
+func (s *service) SchedulerService() ports.SchedulerService {
+	// This should be set during initialization
+	// For now, just return a placeholder
+	// In a real implementation, this should be properly initialized
+	return nil
+}
+
 func (s *service) Close() {
 	s.eventStore.Close()
 	s.roundStore.Close()
 	s.vtxoStore.Close()
 	s.noteStore.Close()
 	s.marketHourRepo.Close()
+	
+	// Close SQLite DB if it exists
+	if s.sqliteDB != nil {
+		s.sqliteDB.Close()
+	}
 }
