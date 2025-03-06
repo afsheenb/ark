@@ -1,4 +1,4 @@
-module github.com/ark-network/ark/api-spec
+module github.com/afsheenb/ark/api-spec
 
 go 1.23.1
 
