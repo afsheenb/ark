@@ -271,3 +271,49 @@ func readRows(rows []queries.Vtxo) ([]domain.Vtxo, error) {
 
 	return vtxos, nil
 }
+
+
+func (r *vxtoRepository) GetVtxosForUpdate(ctx context.Context, keys []domain.VtxoKey) ([]domain.Vtxo, error) {
+    // Build a query with FOR UPDATE to lock the rows
+    query := `SELECT txid, vout, amount, pubkey, spent, redeemed, swept, round_txid, 
+              spent_by, expire_at, redeem_tx, created_at
+              FROM vtxos 
+              WHERE (txid, vout) IN (` + r.createInClause(len(keys)) + `)
+              FOR UPDATE`
+              
+    // Map the VtxoKeys to flat arguments for the query
+    args := make([]interface{}, 0, len(keys)*2)
+    for _, key := range keys {
+        args = append(args, key.Txid, key.VOut)
+    }
+    
+    // Execute the query
+    rows, err := r.db.QueryContext(ctx, query, args...)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+    
+    // Parse results
+    var vtxos []domain.Vtxo
+    for rows.Next() {
+        var v domain.Vtxo
+        if err := rows.Scan(&v.Txid, &v.VOut, &v.Amount, &v.PubKey, &v.Spent, 
+                           &v.Redeemed, &v.Swept, &v.RoundTxid, &v.SpentBy, 
+                           &v.ExpireAt, &v.RedeemTx, &v.CreatedAt); err != nil {
+            return nil, err
+        }
+        vtxos = append(vtxos, v)
+    }
+    
+    return vtxos, nil
+}
+
+func (r *vxtoRepository) createInClause(n int) string {
+    // Helper to create SQL IN clause with parameter placeholders
+    placeholders := make([]string, n)
+    for i := 0; i < n; i++ {
+        placeholders[i] = "(?, ?)"
+    }
+    return strings.Join(placeholders, ", ")
+}

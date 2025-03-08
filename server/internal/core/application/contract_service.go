@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/ark-network/ark/server/internal/core/domain"
 	"github.com/ark-network/ark/server/internal/core/ports"
 )
@@ -464,6 +463,18 @@ func (s *ContractService) checkContractExpiration(contractID string) {
 	}
 }
 
+// BtcWalletService interface for interacting with Bitcoin wallet
+type BtcWalletService interface {
+	// GetCurrentHeight gets the current blockchain height
+	GetCurrentHeight() (int32, error)
+	
+	// SignTransaction signs a transaction
+	SignTransaction(tx *domain.Transaction) (*domain.Transaction, error)
+	
+	// BroadcastTransaction broadcasts a transaction to the network
+	BroadcastTransaction(tx *domain.Transaction) (string, error)
+}
+
 // EventPublisher interface for publishing contract events
 type EventPublisher interface {
 	// PublishContractCreated publishes a contract created event
@@ -474,6 +485,13 @@ type EventPublisher interface {
 	
 	// PublishContractSettled publishes a contract settled event
 	PublishContractSettled(contractID, settlementTxid, winnerPubkey string)
+}
+
+// UTXO represents an unspent transaction output
+type UTXO struct {
+	TxID        string
+	OutputIndex uint32
+	Amount      uint64
 }
 
 // buildAndExecuteSettlementTransaction builds and broadcasts a settlement transaction
@@ -495,19 +513,19 @@ func (s *ContractService) buildAndExecuteSettlementTransaction(
 	}
 	
 	// 1. Get the contract utxo from the final transaction
-	if contract.FinalTxID == "" {
+	if contract.FinalTxid == "" {
 		return "", errors.New("contract does not have a final transaction")
 	}
 	
 	// Get contract utxo details (transaction output that represents the contract funds)
-	contractUTXO, err := s.repos.TransactionRepository().GetContractUTXO(contract.ID, contract.FinalTxID)
+	contractUTXO, err := s.repos.GetTransactionRepository().GetContractUTXO(contract.ID, contract.FinalTxid)
 	if err != nil {
 		return "", fmt.Errorf("failed to get contract UTXO: %w", err)
 	}
 	
 	// 2. Find the corresponding script path for the winner
 	var scriptPathName string
-	if contract.Type == domain.ContractTypeCall {
+	if contract.ContractType == domain.ContractTypeCall {
 		// For CALL options, high hashrate means buyer wins
 		if winnerPubkey == contract.BuyerPubkey {
 			scriptPathName = "high_hashrate_path"
@@ -531,7 +549,7 @@ func (s *ContractService) buildAndExecuteSettlementTransaction(
 	currentTime := time.Now().Unix()
 	
 	// 4. Create settlement transaction inputs
-	txInputs := []domain.TransactionInput{
+	txInputs := []domain.TxInput{
 		{
 			TxID:        contractUTXO.TxID,
 			OutputIndex: contractUTXO.OutputIndex,
@@ -542,7 +560,7 @@ func (s *ContractService) buildAndExecuteSettlementTransaction(
 	
 	// 5. Create settlement transaction outputs
 	winnerAmount := contractUTXO.Amount - 1000 // Subtract fee
-	txOutputs := []domain.TransactionOutput{
+	txOutputs := []domain.TxOutput{
 		{
 			PubKey: winnerPubkey,
 			Amount: winnerAmount,
@@ -550,7 +568,7 @@ func (s *ContractService) buildAndExecuteSettlementTransaction(
 	}
 	
 	// 6. Build the settlement transaction
-	txParams := domain.TransactionParams{
+	txParams := domain.TxParams{
 		Inputs:       txInputs,
 		Outputs:      txOutputs,
 		CurrentTime:  currentTime,
@@ -558,7 +576,7 @@ func (s *ContractService) buildAndExecuteSettlementTransaction(
 		FeeRate:      5, // sat/vbyte
 	}
 	
-	settlementTx, err := s.repos.TransactionRepository().BuildTransaction(txParams)
+	settlementTx, err := s.repos.GetTransactionRepository().BuildTransaction(txParams)
 	if err != nil {
 		return "", fmt.Errorf("failed to build settlement transaction: %w", err)
 	}
@@ -576,18 +594,18 @@ func (s *ContractService) buildAndExecuteSettlementTransaction(
 	}
 	
 	// 9. Record the settlement transaction in the repository
-	settlementTxRecord := &domain.ContractTransaction{
+	settlementTxRecord := &domain.TxRecord{
 		ContractID:   contract.ID,
 		TxID:         txid,
-		Type:         domain.TransactionTypeSettlement,
+		Type:         domain.TxTypeSettlement,
 		Amount:       winnerAmount,
 		Timestamp:    currentTime,
 		BlockHeight:  currentHeight,
-		Status:       domain.TransactionStatusBroadcast,
+		Status:       domain.TxStatusBroadcast,
 		WinnerPubkey: winnerPubkey,
 	}
 	
-	err = s.repos.TransactionRepository().SaveContractTransaction(settlementTxRecord)
+	err = s.repos.GetTransactionRepository().SaveContractTransaction(settlementTxRecord)
 	if err != nil {
 		// Log but continue, as the transaction is already broadcast
 		fmt.Printf("Failed to save settlement transaction record: %v\n", err)

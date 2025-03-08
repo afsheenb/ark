@@ -1,6 +1,7 @@
 package ports
 
 import "github.com/ark-network/ark/server/internal/core/domain"
+import "context"
 
 type RepoManager interface {
 	// Original repositories
@@ -18,6 +19,8 @@ type RepoManager interface {
 	HashrateRepository() domain.HashrateRepository
 	OrderRepository() domain.OrderRepository
 	TradeRepository() domain.TradeRepository
+	GetTransactionRepository() TransactionRepository
+	ExecuteInTransaction(ctx context.Context, fn func(ctx context.Context) error) error
 	
 	// Access to the scheduler service
 	SchedulerService() SchedulerService

@@ -97,16 +97,6 @@ func (h *HashrateCalculator) CalculateTargetTimestamp(
 	return targetTimestamp, nil
 }
 
-// BtcWalletService is an interface for accessing Bitcoin blockchain data
-// This allows us to mock the wallet service for testing
-type BtcWalletService interface {
-	// GetBlockInfo retrieves information about a specific block
-	GetBlockInfo(height int32) (*BlockInfo, error)
-	
-	// GetCurrentHeight returns the current blockchain height
-	GetCurrentHeight() (int32, error)
-}
-
 // BlockInfo contains relevant information about a Bitcoin block
 type BlockInfo struct {
 	Height     int32  `json:"height"`

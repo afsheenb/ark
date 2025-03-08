@@ -26,7 +26,6 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
-	"github.com/jmoiron/sqlx"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	log "github.com/sirupsen/logrus"
 )
@@ -409,33 +408,35 @@ func (s *covenantlessService) SubmitRedeemTx(
 
 	// Fetch all VTXOs in a single query with a transaction
 	var spentVtxos []domain.Vtxo
-	err = s.repoManager.ExecuteInTransaction(ctx, func(tx *sqlx.Tx) error {
-		var err error
-		spentVtxos, err = vtxoRepo.GetVtxosForUpdate(ctx, spentVtxoKeys)
-		if err != nil {
-			return fmt.Errorf("failed to get vtxos with lock: %w", err)
+	// Update the ExecuteInTransaction call at line 412
+	err = s.repoManager.ExecuteInTransaction(ctx, func(ctx context.Context) error {
+	    var err error
+	    spentVtxos, err = vtxoRepo.GetVtxosForUpdate(ctx, spentVtxoKeys)
+	    if err != nil {
+		return fmt.Errorf("failed to get vtxos with lock: %w", err)
+	    }
+	    
+	    if len(spentVtxos) != len(spentVtxoKeys) {
+		return fmt.Errorf("some vtxos not found: expected %d, got %d", 
+		    len(spentVtxoKeys), len(spentVtxos))
+	    }
+	    
+	    // Validate none are already spent
+	    for _, vtxo := range spentVtxos {
+		if vtxo.Spent {
+		    return fmt.Errorf("vtxo %s:%d already spent", vtxo.Txid, vtxo.VOut)
 		}
-		
-		if len(spentVtxos) != len(spentVtxoKeys) {
-			return fmt.Errorf("some vtxos not found: expected %d, got %d", 
-				len(spentVtxoKeys), len(spentVtxos))
+		if vtxo.Redeemed {
+		    return fmt.Errorf("vtxo %s:%d already redeemed", vtxo.Txid, vtxo.VOut)
 		}
-		
-		// Validate none are already spent
-		for _, vtxo := range spentVtxos {
-			if vtxo.Spent {
-				return fmt.Errorf("vtxo %s:%d already spent", vtxo.Txid, vtxo.VOut)
-			}
-			if vtxo.Redeemed {
-				return fmt.Errorf("vtxo %s:%d already redeemed", vtxo.Txid, vtxo.VOut)
-			}
-			if vtxo.Swept {
-				return fmt.Errorf("vtxo %s:%d already swept", vtxo.Txid, vtxo.VOut)
-			}
+		if vtxo.Swept {
+		    return fmt.Errorf("vtxo %s:%d already swept", vtxo.Txid, vtxo.VOut)
 		}
-		
-		return nil
-	})
+	    }
+	    
+	    return nil
+	})	
+
 	
 	if err != nil {
 		return "", "", err
@@ -671,7 +672,7 @@ func (s *covenantlessService) SubmitRedeemTx(
 	// Wrap in a database transaction to ensure atomicity
 	var newVtxos []domain.Vtxo
 	
-	err = s.repoManager.ExecuteInTransaction(ctx, func(tx *sqlx.Tx) error {
+	err = s.repoManager.ExecuteInTransaction(ctx, func(ctx context.Context) error{
 		// Create new VTXOs from outputs
 		newVtxos = make([]domain.Vtxo, 0, len(redeemPtx.UnsignedTx.TxOut))
 		for outIndex, out := range outputs {
@@ -1113,93 +1114,94 @@ func (s *covenantlessService) SignRoundTx(ctx context.Context, signedRoundTx str
 }
 
 func (s *covenantlessService) checkForfeitsAndBoardingSigsSent(currentRound *domain.Round) {
-	if currentRound == nil {
-		log.Error().Msg("checkForfeitsAndBoardingSigsSent called with nil round")
-		return
-	}
-	
-	if currentRound.UnsignedTx == "" {
-		log.Error().Str("round_id", currentRound.Id).Msg("Round has empty UnsignedTx")
-		return
-	}
-	
-	// Parse the transaction to check signatures
-	roundTx, err := psbt.NewFromRawBytes(strings.NewReader(currentRound.UnsignedTx), true)
-	if err != nil {
-		log.Error().
-			Err(err).
-			Str("round_id", currentRound.Id).
-			Msg("Failed to parse round transaction")
-		return
-	}
-	
-	// Count signed inputs to verify boarding inputs are signed
-	numOfInputsSigned := 0
-	for i, v := range roundTx.Inputs {
-		if len(v.TaprootScriptSpendSig) > 0 {
-			if len(v.TaprootScriptSpendSig[0].Signature) > 0 {
-				numOfInputsSigned++
-				log.Debug().
-					Str("round_id", currentRound.Id).
-					Int("input_index", i).
-					Msg("Input is signed")
-			} else {
-				log.Debug().
-					Str("round_id", currentRound.Id).
-					Int("input_index", i).
-					Msg("Input has empty signature")
-			}
-		} else {
-			log.Debug().
-				Str("round_id", currentRound.Id).
-				Int("input_index", i).
-				Msg("Input has no TaprootScriptSpendSig")
-		}
-	}
+    if currentRound == nil {
+        log.Errorf("checkForfeitsAndBoardingSigsSent called with nil round")
+        return
+    }
+    
+    if currentRound.UnsignedTx == "" {
+        log.Errorf("round_id %s has empty UnsignedTx", currentRound.Id)
+        return
+    }
+    
+    // Parse the transaction to check signatures
+    roundTx, err := psbt.NewFromRawBytes(strings.NewReader(currentRound.UnsignedTx), true)
+    if err != nil {
+        log.Errorf("Failed to parse round transaction: %v", err)
+        return
+    }
+    
+    // Count signed inputs to verify boarding inputs are signed
+    numOfInputsSigned := 0
+    for i, v := range roundTx.Inputs {
+        if len(v.TaprootScriptSpendSig) > 0 {
+            if len(v.TaprootScriptSpendSig[0].Signature) > 0 {
+                numOfInputsSigned++
+                log.WithFields(log.Fields{
+                    "round_id": currentRound.Id,
+                    "input_index": i,
+                }).Debug("Input is signed")
+            } else {
+                log.WithFields(log.Fields{
+                    "round_id": currentRound.Id,
+                    "input_index": i,
+                }).Debug("Input has empty signature")
+            }
+        } else {
+            log.WithFields(log.Fields{
+                "round_id": currentRound.Id,
+                "input_index": i,
+            }).Debug("Input has no TaprootScriptSpendSig")
+        }
+    }
 
-	// Create a mutex to protect this operation
-	sigCheckMutex := &sync.Mutex{}
-	sigCheckMutex.Lock()
-	defer sigCheckMutex.Unlock()
-	
-	// Get the current number of expected boarding inputs
-	s.numOfBoardingInputsMtx.RLock()
-	numOfBoardingInputs := s.numOfBoardingInputs
-	s.numOfBoardingInputsMtx.RUnlock()
-	
-	// Check if all forfeit transactions are signed
-	allForfeitsSigned := s.forfeitTxs.allSigned()
-	
-	log.Debug().
-		Str("round_id", currentRound.Id).
-		Int("num_signed_inputs", numOfInputsSigned).
-		Int("expected_boarding_inputs", numOfBoardingInputs).
-		Bool("all_forfeits_signed", allForfeitsSigned).
-		Msg("Checking signature completion status")
-	
-	// Check completion condition:
-	// 1. All forfeit transactions must be signed
-	// 2. The number of signed boarding inputs must match the expected count
-	if allForfeitsSigned && numOfBoardingInputs == numOfInputsSigned {
-		log.Info().
-			Str("round_id", currentRound.Id).
-			Msg("All signatures collected, proceeding with round")
-			
-		// Signal completion non-blocking
-		select {
-		case s.forfeitsBoardingSigsChan <- struct{}{}:
-			log.Debug().Str("round_id", currentRound.Id).Msg("Sent forfeit signature completion signal")
-		default:
-			log.Debug().Str("round_id", currentRound.Id).Msg("Channel already has completion signal")
-		}
-	} else {
-		log.Debug().
-			Str("round_id", currentRound.Id).
-			Bool("forfeits_signed", allForfeitsSigned).
-			Int("signed_inputs", numOfInputsSigned).
-			Int("expected_inputs", numOfBoardingInputs).
-			Msg("Not all signatures are collected yet")
-	}
+    // Create a mutex to protect this operation
+    sigCheckMutex := &sync.Mutex{}
+    sigCheckMutex.Lock()
+    defer sigCheckMutex.Unlock()
+    
+    // Get the current number of expected boarding inputs
+    s.numOfBoardingInputsMtx.RLock()
+    numOfBoardingInputs := s.numOfBoardingInputs
+    s.numOfBoardingInputsMtx.RUnlock()
+    
+    // Check if all forfeit transactions are signed
+    allForfeitsSigned := s.forfeitTxs.allSigned()
+    
+    log.WithFields(log.Fields{
+        "round_id": currentRound.Id,
+        "num_signed_inputs": numOfInputsSigned,
+        "expected_boarding_inputs": numOfBoardingInputs,
+        "all_forfeits_signed": allForfeitsSigned,
+    }).Debug("Checking signature completion status")
+    
+    // Check completion condition:
+    // 1. All forfeit transactions must be signed
+    // 2. The number of signed boarding inputs must match the expected count
+    if allForfeitsSigned && numOfBoardingInputs == numOfInputsSigned {
+        log.WithFields(log.Fields{
+            "round_id": currentRound.Id,
+        }).Info("All signatures collected, proceeding with round")
+        
+        // Signal completion non-blocking
+        select {
+        case s.forfeitsBoardingSigsChan <- struct{}{}:
+            log.WithFields(log.Fields{
+                "round_id": currentRound.Id,
+            }).Debug("Sent forfeit signature completion signal")
+        default:
+            log.WithFields(log.Fields{
+                "round_id": currentRound.Id,
+            }).Debug("Channel already has completion signal")
+        }
+    } else {
+        log.WithFields(log.Fields{
+            "round_id": currentRound.Id,
+            "forfeits_signed": allForfeitsSigned,
+            "signed_inputs": numOfInputsSigned,
+            "expected_inputs": numOfBoardingInputs,
+        }).Debug("Not all signatures are collected yet")
+    }
 }
 
 func (s *covenantlessService) ListVtxos(ctx context.Context, address string) ([]domain.Vtxo, []domain.Vtxo, error) {
@@ -2508,6 +2510,15 @@ func (s *covenantlessService) UpdateMarketHourConfig(
 // BtcWalletAdapter adapts the WalletService to BtcWalletService interface
 type btcWalletAdapter struct {
 	wallet ports.WalletService
+}
+
+
+func (a *btcWalletAdapter) BroadcastTransaction(ctx context.Context, tx *domain.Transaction) (string, error) {
+    txHex, err := tx.Serialize() // assuming `Serialize` converts the transaction to a string
+    if err != nil {
+        return "", err
+    }
+    return a.wallet.BroadcastTransaction(ctx, txHex)
 }
 
 // GetBlockInfo implements BtcWalletService.GetBlockInfo by converting ports.BlockInfo to application.BlockInfo
